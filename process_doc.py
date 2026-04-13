@@ -422,8 +422,8 @@ def replace_images_in_md(md_content, images_info, output_folder):
     # Create counter to track replacement order
     img_index = [0]  # Use list to pass by reference
 
-    # Replace all HTML image comments with appropriate content
-    def replace_image_comment(match):
+    # Replace all embedded base64 image references with appropriate content
+    def replace_base64_image(match):
         if img_index[0] < len(images_info):
             filename, summary = images_info[img_index[0]]
             current_idx = img_index[0]
@@ -438,20 +438,17 @@ def replace_images_in_md(md_content, images_info, output_folder):
             else:
                 # Rejected image - just placeholder
                 logger.info(f"Replacing image {current_idx} ({filename}) with rejection reason")
-                return f"<!-- Image filtered out: {summary} -->"
+                return f"<!-- Image is excluded: {summary} -->"
 
         logger.warning(f"Image index {img_index[0]} exceeds images_info length {len(images_info)}")
         return match.group(0)
 
-    # Replace HTML image comments (format: <!-- image -->)
-    original_count = len(re.findall(r'<!-- image -->', md_content))
-    logger.info(f"Found {original_count} image placeholder comments in markdown")
+    # Replace embedded base64 image references (format: ![...](data:image/...))
+    embedded_image_pattern = re.compile(r'!\[.*?\]\(data:image/[^)]+\)')
+    original_count = len(embedded_image_pattern.findall(md_content))
+    logger.info(f"Found {original_count} embedded base64 image references in markdown")
 
-    md_content = re.sub(
-        r'<!-- image -->',
-        replace_image_comment,
-        md_content
-    )
+    md_content = embedded_image_pattern.sub(replace_base64_image, md_content)
 
     logger.info(f"Replaced {len(accepted_images)} accepted images with summaries")
     logger.info(f"Replaced {len(rejected_images)} rejected images with placeholders")
