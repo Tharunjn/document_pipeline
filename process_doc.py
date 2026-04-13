@@ -10,6 +10,7 @@ from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 from docling_core.types.doc.base import ImageRefMode
+import shutil
 import requests
 
 # Setup logging
@@ -365,7 +366,6 @@ def extract_and_summarize_images(doc, output_folder):
 
             # Copy to filtered folder
             filtered_path = filtered_dir / img_info['filename']
-            import shutil
             shutil.copy2(extracted_path, filtered_path)
             logger.info(f"Accepted and copied: {img_info['filename']}")
 
@@ -396,6 +396,135 @@ def extract_and_summarize_images(doc, output_folder):
     # Combine for markdown replacement: accepted images with summaries, rejected with placeholders
     all_images_for_replacement = final_images + rejected_images
     return all_images_for_replacement
+
+def extract_context_from_lines(lines, img_line_idx, before=20, after=10, max_chars=1500):
+    """
+    Extract surrounding text context from markdown lines around an image.
+
+    Args:
+        lines: List of markdown lines (split on '\\n')
+        img_line_idx: Line index of the image tag
+        before: Number of lines to look before the image
+        after: Number of lines to look after the image
+        max_chars: Maximum characters to return (keeps the tail)
+
+    Returns:
+        Context string with nearby text, excluding other base64 images.
+    """
+    start = max(0, img_line_idx - before)
+    end = min(len(lines), img_line_idx + after + 1)
+
+    context_lines = []
+    for i in range(start, end):
+        if i == img_line_idx:
+            continue  # skip the image line itself
+        line = lines[i]
+        # Replace other embedded base64 images with a short placeholder
+        if re.match(r'!\[[^\]]*\]\(data:image/', line):
+            context_lines.append('[embedded image]')
+            continue
+        context_lines.append(line)
+
+    context = '\n'.join(context_lines).strip()
+    if len(context) > max_chars:
+        context = context[-max_chars:]
+    return context
+
+
+def process_embedded_images_in_markdown(md_content, output_folder):
+    """
+    Process embedded base64 images directly from the markdown string.
+
+    For each embedded image (in markdown order):
+      - Decode base64 bytes and save to extracted_images/
+      - Filter with is_significant_image
+      - If accepted: extract surrounding markdown context, call VLM for a
+        summary, save to filtered_images/, and replace the tag with a file
+        reference + summary block
+      - If rejected: replace the tag with an HTML comment explaining why
+
+    Args:
+        md_content: Markdown string produced by export_to_markdown(EMBEDDED)
+        output_folder: Path to the output directory
+
+    Returns:
+        Modified markdown string with replacements applied in place.
+    """
+    extracted_dir = output_folder / 'extracted_images'
+    filtered_dir = output_folder / 'filtered_images'
+    extracted_dir.mkdir(exist_ok=True)
+    filtered_dir.mkdir(exist_ok=True)
+
+    # Split into lines once so context extraction can reference them
+    lines = md_content.split('\n')
+
+    # Pattern matches the full markdown image tag containing a data URI,
+    # e.g.  ![](data:image/png;base64,iVBOR...)
+    # Base64 alphabet plus padding '=' and no ')' makes [^)]+ safe here.
+    EMBEDDED_IMAGE_RE = re.compile(r'!\[[^\]]*\]\(data:image/[^)]+\)')
+
+    img_counter = 0
+
+    def replace_match(match):
+        nonlocal img_counter
+        i = img_counter
+        img_counter += 1
+
+        full_match = match.group(0)
+
+        # --- decode base64 payload ---
+        data_uri_match = re.search(
+            r'data:image/([^;]+);base64,([A-Za-z0-9+/=\s]+)',
+            full_match
+        )
+        if not data_uri_match:
+            logger.warning(f"image_{i}: could not parse data URI, leaving unchanged")
+            return full_match
+
+        b64_data = data_uri_match.group(2).strip()
+        try:
+            img_bytes = base64.b64decode(b64_data)
+        except Exception as e:
+            logger.error(f"image_{i}: base64 decode error: {e}")
+            return f"<!-- Image is excluded: base64 decode error -->"
+
+        # --- save to extracted_images/ ---
+        img_filename = f"image_{i}.png"
+        extracted_path = extracted_dir / img_filename
+        with open(extracted_path, 'wb') as f:
+            f.write(img_bytes)
+        logger.info(f"Extracted image_{i} ({len(img_bytes)} bytes)")
+
+        # --- filter ---
+        if not is_significant_image(extracted_path, min_width=80, min_height=80, min_size_kb=25):
+            rejection_reason = "Image filtered out - too small or insignificant"
+            logger.info(f"Rejected image_{i}: {rejection_reason}")
+            return f"<!-- Image is excluded: {rejection_reason} -->"
+
+        # --- extract markdown context (use original line positions) ---
+        text_before = md_content[:match.start()]
+        img_line_idx = text_before.count('\n')
+        context_text = extract_context_from_lines(lines, img_line_idx)
+        logger.info(f"image_{i}: context length {len(context_text)} chars")
+
+        # --- save to filtered_images/ ---
+        filtered_path = filtered_dir / img_filename
+        shutil.copy2(extracted_path, filtered_path)
+
+        # --- get VLM summary ---
+        try:
+            summary = get_vlm_summary(img_bytes, context_text=context_text)
+        except Exception as e:
+            logger.error(f"image_{i}: VLM error: {e}")
+            summary = "Image summary not available."
+
+        logger.info(f"Accepted image_{i}, summary length: {len(summary)} chars")
+        return f"![Image](./filtered_images/{img_filename})\n\n**Summary:** {summary}"
+
+    result = EMBEDDED_IMAGE_RE.sub(replace_match, md_content)
+    logger.info(f"process_embedded_images_in_markdown: processed {img_counter} embedded image(s)")
+    return result
+
 
 def replace_images_in_md(md_content, images_info, output_folder):
     """
@@ -522,37 +651,31 @@ def main(input_file, output_folder):
     result = converter.convert(str(input_path))
     doc = result.document
 
-    # Extract images and get summaries
-    logger.info("Extracting images...")
-    images_info = extract_and_summarize_images(doc, output_path)
-    logger.info(f"Extracted {len(images_info)} images")
-
-    # Export to Markdown
-    logger.info("Generating Markdown...")
+    # --- Step 1: generate markdown with embedded base64 images ---
+    logger.info("Generating Markdown with embedded images...")
     md_content = doc.export_to_markdown(image_mode=ImageRefMode.EMBEDDED)
 
-    # Debug: Check for image references in markdown
-    import re
-    image_refs = re.findall(r'!\[.*?\]\([^)]+\)', md_content)
-    logger.info(f"Found {len(image_refs)} image references in markdown:")
-    for ref in image_refs[:5]:  # Show first 5
-        logger.debug(f"  {ref[:100]}")
-
-    # Replace images with file references and summaries
-    if images_info:
-        md_content = replace_images_in_md(md_content, images_info, output_path)
-        logger.info(f"Replaced images in markdown")
-    else:
-        logger.warning("Warning: No images extracted!")
-
-    # Save the full Markdown
-    with open(output_path / 'document.md', 'w', encoding='utf-8') as f:
+    # --- Step 2: save the original markdown (no replacements) ---
+    with open(output_path / 'document_original.md', 'w', encoding='utf-8') as f:
         f.write(md_content)
-    logger.info(f"Saved Markdown to {output_path / 'document.md'}")
+    logger.info(f"Saved original Markdown to {output_path / 'document_original.md'}")
 
-    # Perform smart chunking
+    # Debug: report how many embedded images were found
+    embedded_count = len(re.findall(r'!\[[^\]]*\]\(data:image/', md_content))
+    logger.info(f"Found {embedded_count} embedded base64 image(s) in markdown")
+
+    # --- Step 3: process images from markdown, replace with summaries ---
+    logger.info("Processing embedded images in markdown...")
+    md_with_summaries = process_embedded_images_in_markdown(md_content, output_path)
+
+    # --- Step 4: save the replaced markdown ---
+    with open(output_path / 'document.md', 'w', encoding='utf-8') as f:
+        f.write(md_with_summaries)
+    logger.info(f"Saved Markdown with summaries to {output_path / 'document.md'}")
+
+    # --- Step 5: chunk the replaced markdown ---
     logger.info("Chunking document...")
-    smart_chunk_markdown(md_content, output_path)
+    smart_chunk_markdown(md_with_summaries, output_path)
 
     logger.info(f"✓ Processing complete. Output in {output_folder}")
     logger.info(f"Log file: {log_file}")
